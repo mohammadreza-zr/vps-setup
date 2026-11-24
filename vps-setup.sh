@@ -2268,6 +2268,7 @@ ssh_verify() { # ssh_verify <port>... - checks the EFFECTIVE config, not just ou
     grep -qxF "$want" <<<"$eff" || problems+=("expected '$want', effective: '$(grep -E "^${want%% *} " <<<"$eff" || echo unset)'")
   done
   grep -qE "^allowgroups( .*)? $SSH_GROUP( |\$)" <<<"$eff" || problems+=("AllowGroups does not include $SSH_GROUP")
+  if [[ -n $(ssh_stale_listeners) ]]; then problems+=("an old sshd (pid $(ssh_stale_listeners | xargs)) still holds a port with its old configuration - run: sudo vps-setup ssh"); fi
   if grep -qE '^allowusers ' <<<"$eff"; then problems+=("an AllowUsers line is still active"); fi
   if (( ${#problems[@]} > 0 )); then
     for line in "${problems[@]}"; do warn "sshd: $line"; done
@@ -2309,10 +2310,34 @@ ssh_restore() { # restore the snapshot and run sshd the way it ran before
     systemctl enable --now ssh.socket
   else
     systemctl restart ssh.service
+    ssh_kill_stale_listeners
   fi
   rm -f "$ROLLBACK_DIR/applied_at"
   if [[ -f $ROLLBACK_DIR/old_ports ]]; then apply_fail2ban $(cat "$ROLLBACK_DIR/old_ports") || true; fi
   log_file "SSH configuration rolled back"
+}
+
+# sshd listeners that are not ssh.service's current main process. ssh.service has
+# KillMode=process, so a restart only replaces the main sshd: a listener left over from an
+# earlier start (e.g. the package upgrade during setup) keeps its port with the OLD
+# configuration - root login, no AllowGroups. Found with server-setup on a test server.
+ssh_stale_listeners() {
+  local main pid
+  main=$(systemctl show ssh.service -p MainPID --value 2>/dev/null)
+  for pid in $(ss -Htlnp 2>/dev/null | grep '"sshd"' | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u); do
+    [[ $pid != "$main" ]] && printf '%s\n' "$pid"
+  done
+  return 0
+}
+ssh_kill_stale_listeners() {
+  local pids
+  pids=$(ssh_stale_listeners | xargs)
+  [[ -n $pids ]] || return 0
+  warn "Stopping sshd listener(s) left over from an earlier start (old configuration): $pids"
+  kill -TERM $pids 2>/dev/null || true
+  sleep 1
+  kill -KILL $pids 2>/dev/null || true
+  systemctl restart ssh.service
 }
 
 ssh_use_service_mode() {
@@ -2325,6 +2350,7 @@ ssh_use_service_mode() {
   fi
   systemctl enable ssh.service >>"$LOG_FILE" 2>&1
   systemctl restart ssh.service
+  ssh_kill_stale_listeners
 }
 
 schedule_rollback() {
