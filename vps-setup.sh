@@ -19,7 +19,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.2.0"
+readonly SCRIPT_VERSION="2.3.0"
 readonly INSTALL_PATH="/usr/local/sbin/vps-setup"
 readonly LIB_DIR="/usr/local/lib/vps-setup"
 readonly STATE_DIR="/etc/vps-setup"
@@ -34,6 +34,8 @@ readonly REPORT_FILE="/root/vps-setup-report.txt"
 readonly LOG_FILE="/var/log/vps-setup.log"
 readonly SSH_DROPIN_NAME="00-vps-setup.conf"
 readonly VNC_SESSION="$LIB_DIR/vnc-session"
+readonly VNC_TIMEOUT_CMD="/usr/local/bin/vnc-timeout"          # each user sets their own disconnect timeout
+readonly VNC_TIMEOUT_DEFAULT="$LIB_DIR/vnc-disconnect-timeout"  # the server default for it
 readonly VNC_UNIT_FILE="/etc/systemd/system/vps-vnc@.service"
 readonly GITLAB_GW="$LIB_DIR/gitlab-gw"
 readonly GITLAB_UNIT="vps-gitlab-gw.service"
@@ -164,6 +166,20 @@ apt_get() {
 # ----------------------------------------------------------------------------
 trim() { local s=$1; s=${s#"${s%%[![:space:]]*}"}; s=${s%"${s##*[![:space:]]}"}; printf '%s' "$s"; }
 in_group() { [[ " $(id -nG "$1" 2>/dev/null) " == *" $2 "* ]]; }
+# duration_secs <5m|90s|2h|3d|off> - prints seconds (a bare number is minutes, off/never/0 is 0);
+# fails on anything else. Also copied into vnc-timeout, so both read durations the same way.
+duration_secs() {
+  local v=${1,,} n
+  case $v in off|never|0) echo 0; return 0 ;; esac
+  [[ $v =~ ^([0-9]{1,6})([smhd]?)$ ]] || return 1
+  n=$((10#${BASH_REMATCH[1]}))
+  case ${BASH_REMATCH[2]} in
+    s) echo "$n" ;;
+    h) echo $((n * 3600)) ;;
+    d) echo $((n * 86400)) ;;
+    *) echo $((n * 60)) ;;
+  esac
+}
 home_of() { local e; e=$(getent passwd "$1") || return 1; cut -d: -f6 <<<"$e"; }
 is_human_uid() { (( $1 >= 1000 && $1 < 60000 )); }
 user_has_password() { local h; h=$(getent shadow "$1" | cut -d: -f2) || return 1; [[ $h == \$* ]]; }   # a real hash ($y$, $6$...)
@@ -597,10 +613,51 @@ migrate_v1() { # clean up what the first version of this script left behind
     backup_file "$f"; rm -f "$f"; systemctl daemon-reload
     note "Stopped the old VNC desktops (they listened on TCP, reachable by every user). Re-enable: vps-setup vnc enable <user>"
   fi
+  retire_tigervnc
   if command -v ufw >/dev/null; then
     for u in 3389 5901 5902 5903 5904 5905; do ufw delete allow "$u/tcp" >>"$LOG_FILE" 2>&1 || true; done
   fi
   if [[ -f /etc/xrdp/xrdp.ini ]]; then xrdp_bind_localhost; fi
+}
+
+# retire_tigervnc [<user>] - stop the desktops of Ubuntu's own tigervncserver@:N units (mapped in
+# /etc/tigervnc/vncserver.users) for everyone, or for that user plus the leftovers that can never
+# run (mapped to a user who no longer exists, or not mapped at all). They listen on TCP 590N, which
+# every user on the server can reach, and a second desktop next to vps-vnc@ breaks single-instance
+# apps: Chrome or VS Code started on one desktop only open their windows on the other.
+retire_tigervnc() {
+  local only=${1-} f=/etc/tigervnc/vncserver.users unit disp name stopped=() retired=()
+  local -A owner=()
+  if [[ -f $f ]]; then
+    while IFS='=' read -r disp name; do
+      disp=${disp//[[:space:]]/}; name=${name//[[:space:]]/}
+      [[ $disp =~ ^:[0-9]+$ && -n $name ]] && owner[$disp]=$name
+    done < <(grep -E '^[[:space:]]*:[0-9]+[[:space:]]*=' "$f" || true)
+  fi
+  # every unit that is mapped, enabled or running
+  for unit in $( { systemctl list-units --all --plain --no-legend 'tigervncserver@*' 2>/dev/null | awk '{print $1}'
+                   find /etc/systemd/system -name 'tigervncserver@*.service' -type l -printf '%f\n' 2>/dev/null
+                   for disp in "${!owner[@]}"; do echo "tigervncserver@$disp.service"; done; } | sort -u ); do
+    disp=${unit#tigervncserver@}; disp=${disp%.service}
+    name=${owner[$disp]-}
+    if [[ -n $only && -n $name && $name != "$only" ]] && id "$name" &>/dev/null; then continue; fi
+    [[ $disp =~ ^:[0-9]+$ ]] && retired+=("$disp")
+    if systemctl is-enabled --quiet "$unit" 2>/dev/null || systemctl is-active --quiet "$unit" 2>/dev/null; then
+      systemctl disable --now "$unit" >>"$LOG_FILE" 2>&1 || true
+      stopped+=("$disp${owner[$disp]:+ (${owner[$disp]})}")
+    fi
+  done
+  if [[ -f $f && ${#retired[@]} -gt 0 ]]; then
+    local re="^[[:space:]]*($(IFS='|'; echo "${retired[*]}"))[[:space:]]*="
+    if grep -qE "$re" "$f"; then
+      backup_file "$f"
+      sed -i -E "/$re/s/^(.*)$/# \\1   # retired by vps-setup - use: vps-setup vnc enable <user>/" "$f"
+    fi
+  fi
+  if (( ${#stopped[@]} > 0 )); then
+    note "Stopped the old TigerVNC desktops ${stopped[*]}: they listened on TCP, reachable by every user,"
+    note "  and made Chrome/VS Code open on the wrong desktop. Per user instead: vps-setup vnc enable <user>"
+  fi
 }
 
 apply_hostname_timezone() {
@@ -788,6 +845,122 @@ ensure_swap() {
   if ! swapon /swapfile 2>>"$LOG_FILE"; then rm -f /swapfile; warn "This VPS does not allow swap - skipped."; return 0; fi
   grep -qE '^/swapfile[[:space:]]' /etc/fstab || printf '/swapfile none swap sw 0 0\n' >>/etc/fstab
   note "Created a ${size_mb} MB swap file."
+}
+
+# ----------------------------------------------------------------------------
+# Memory guard - what acts when the RAM runs out (fair sharing only decides who goes first)
+#   zswap: a page leaving RAM is first compressed in RAM (about 3:1), so far less goes to the
+#     swap file and it comes back without disk I/O.
+#   systemd-oomd: when one user's memory pressure stays high (the desktop freezes, everything
+#     waits on swap) or swap is nearly full, it ends that user's heaviest unit - one app, a tmux
+#     session, or the user's whole VNC desktop (its apps run inside vps-vnc@<user>; a fresh one
+#     starts) - instead of letting the whole server crawl. Never sshd or system services.
+# ----------------------------------------------------------------------------
+render_zswap() {
+  cat <<'EOF'
+#!/bin/bash
+# zswap - managed by vps-setup; run at boot by vps-zswap.service.
+p=/sys/module/zswap/parameters
+[[ -d $p ]] || { echo "zswap: not in this kernel - skipped" >&2; exit 0; }
+for z in zsmalloc z3fold zbud; do echo "$z" >"$p/zpool" 2>/dev/null && break; done
+for c in zstd lz4 lzo; do echo "$c" >"$p/compressor" 2>/dev/null && break; done
+echo 20 >"$p/max_pool_percent"
+echo Y >"$p/enabled"
+echo "zswap on: $(cat "$p/compressor")/$(cat "$p/zpool"), up to $(cat "$p/max_pool_percent")% of RAM"
+EOF
+}
+
+apply_memory_guard() {
+  install -d -m 755 "$LIB_DIR"
+  render_zswap >"$LIB_DIR/zswap"; chmod 755 "$LIB_DIR/zswap"
+  cat >/etc/systemd/system/vps-zswap.service <<EOF
+# Managed by vps-setup
+[Unit]
+Description=Compressed RAM cache in front of the swap file (zswap)
+DefaultDependencies=no
+After=local-fs.target
+Before=swap.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$LIB_DIR/zswap
+
+[Install]
+WantedBy=sysinit.target
+EOF
+  systemctl daemon-reload
+  systemctl enable vps-zswap.service >>"$LOG_FILE" 2>&1
+  if systemctl restart vps-zswap.service >>"$LOG_FILE" 2>&1; then
+    note "zswap: swapped-out memory is compressed in RAM first (less swap file, less disk I/O)."
+  else
+    warn "zswap could not be switched on (see $LOG_FILE) - the swap file still works as before."
+  fi
+
+  if ! command -v oomctl >/dev/null && pkg_available systemd-oomd; then
+    run_soft "Installing systemd-oomd" apt_get install systemd-oomd || true
+  fi
+  if ! command -v oomctl >/dev/null; then
+    warn "systemd-oomd is not available here - a full RAM still ends in a slow server and the kernel's OOM killer."
+    return 0
+  fi
+  install -d /etc/systemd/oomd.conf.d /etc/systemd/system/user-.slice.d /etc/systemd/system/user.slice.d \
+             /etc/systemd/system/-.slice.d /etc/systemd/system/ssh.service.d
+  cat >/etc/systemd/oomd.conf.d/90-vps-setup.conf <<'EOF'
+# Managed by vps-setup
+[OOM]
+SwapUsedLimit=90%
+DefaultMemoryPressureLimit=60%
+DefaultMemoryPressureDurationSec=30s
+EOF
+  cat >/etc/systemd/system/user-.slice.d/91-vps-setup-oomd.conf <<'EOF'
+# Managed by vps-setup: a user whose apps wait on memory 60% of the time for 30 s loses the
+# unit (an app scope, or their whole VNC desktop service) reclaiming the most - not the other
+# users, not the server.
+[Slice]
+ManagedOOMMemoryPressure=kill
+ManagedOOMMemoryPressureLimit=60%
+EOF
+  cat >/etc/systemd/system/user.slice.d/91-vps-setup-oomd.conf <<'EOF'
+# Managed by vps-setup: swap above SwapUsedLimit - the user unit using the most swap ends.
+[Slice]
+ManagedOOMSwap=kill
+EOF
+  # Ubuntu's package watches the root slice for swap, which would make system services such as
+  # sshd candidates - only users' apps are (above).
+  cat >/etc/systemd/system/-.slice.d/10-oomd-root-slice-defaults.conf <<'EOF'
+# Managed by vps-setup: replaces the package's default - see user.slice.d/91-vps-setup-oomd.conf
+[Slice]
+ManagedOOMSwap=auto
+EOF
+  printf '# Managed by vps-setup: never end sshd (and the sessions in it) to free memory\n[Service]\nManagedOOMPreference=omit\n' \
+    >/etc/systemd/system/ssh.service.d/90-vps-setup-oomd.conf
+  systemctl daemon-reload
+  if systemctl enable --now systemd-oomd.service >>"$LOG_FILE" 2>&1 && systemctl restart systemd-oomd.service >>"$LOG_FILE" 2>&1; then
+    note "OOM guard (systemd-oomd): when a user's apps thrash or swap is 90% full, that user's heaviest"
+    note "  app or whole VNC desktop is ended (journalctl -u systemd-oomd) - never sshd or system services."
+  else
+    warn "systemd-oomd did not start (see $LOG_FILE)."
+  fi
+}
+
+cmd_memory() {
+  case ${1-apply} in
+    apply) apply_memory_guard; ok "Memory guard applied." ;;
+    status) ;;
+    *) die "usage: vps-setup memory [apply|status]" ;;
+  esac
+  local p=/sys/module/zswap/parameters
+  free -h
+  swapon --show
+  if [[ -r $p/enabled ]]; then
+    info "zswap: enabled=$(cat "$p/enabled") $(cat "$p/compressor")/$(cat "$p/zpool") max $(cat "$p/max_pool_percent")% of RAM"
+  fi
+  if command -v oomctl >/dev/null && systemctl is-active --quiet systemd-oomd; then
+    oomctl 2>/dev/null | grep -E 'Path:|Limit|Pressure Limit|Swap Used' | head -20 || true
+  else
+    info "systemd-oomd: not running"
+  fi
 }
 
 apply_shell_defaults() {
@@ -2020,6 +2193,9 @@ AuthenticationMethods publickey
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 PermitEmptyPasswords no
+# PAM puts every login into its user's own slice (pam_systemd): fair sharing, vps-setup usage
+# and loginctl see SSH and VS Code sessions only then. Passwords stay off (the lines above).
+UsePAM yes
 AllowGroups $SSH_GROUP
 MaxAuthTries 4
 LoginGraceTime 30
@@ -2087,7 +2263,7 @@ ssh_verify() { # ssh_verify <port>... - checks the EFFECTIVE config, not just ou
     [[ $okp == y ]] || problems+=("listen address $line is not on one of the ports $want_ports")
   done < <(awk '$1 == "listenaddress" {print $2}' <<<"$eff")
   for want in "permitrootlogin no" "passwordauthentication no" "kbdinteractiveauthentication no" \
-              "pubkeyauthentication yes" "authenticationmethods publickey" "gatewayports no" \
+              "pubkeyauthentication yes" "authenticationmethods publickey" "gatewayports no" "usepam yes" \
               "allowtcpforwarding yes" "streamlocalbindunlink yes"; do
     grep -qxF "$want" <<<"$eff" || problems+=("expected '$want', effective: '$(grep -E "^${want%% *} " <<<"$eff" || echo unset)'")
   done
@@ -2419,13 +2595,15 @@ cmd_rdp() {
 }
 
 render_vnc_session() {
-  sed "s|@DESKTOP_XDG@|$DESKTOP_XDG|g" <<'EOF'
+  sed -e "s|@DESKTOP_XDG@|$DESKTOP_XDG|g" -e "s|@VNC_TIMEOUT_CMD@|$VNC_TIMEOUT_CMD|g" <<'EOF'
 #!/bin/bash
 # vnc-session - managed by vps-setup; started by vps-vnc@<user>.service as that user.
 # The desktop listens ONLY on ~/.vnc/vnc.sock (mode 0600) - no TCP port - so nobody else
 # on the server can reach it. Connect from your computer through SSH:
 #   ssh -N -L 5901:/home/<you>/.vnc/vnc.sock <server>   then a VNC viewer on localhost:5901
 # Resolution: put e.g. 2560x1440 into ~/.vnc/geometry and restart the desktop.
+# After you disconnect, the desktop closes with every app opened in it once the time set by
+# `vnc-timeout` has passed (5m, 2h, 3d, off); a fresh desktop then waits for your next connection.
 set -euo pipefail
 uid=$(id -u)
 (( uid >= 1000 )) || { echo "vnc-session: refusing to run as a system user" >&2; exit 1; }
@@ -2460,9 +2638,24 @@ Xtigervnc ":$display" -auth "$xauth_file" -rfbunixpath "$sock" -rfbunixmode 0600
   -geometry "$geometry" -depth 24 -desktop "$USER@$(hostname -s)" -AlwaysShared &
 xvnc=$!
 session=""
+# sweep <signal> - signal every process of this user that was started in this desktop. Apps
+# that stayed in this service are ended by systemd anyway; this also reaches the ones that
+# moved out of it (e.g. into a systemd --user scope). Prints how many it found.
+sweep() {
+  local p n=0
+  for p in /proc/[0-9]*; do
+    [[ -O $p && ${p#/proc/} != "$$" ]] || continue
+    if grep -qxzF "VPS_VNC_DESKTOP=:$display" "$p/environ" 2>/dev/null; then
+      kill -s "$1" "${p#/proc/}" 2>/dev/null && n=$((n + 1))
+    fi
+  done
+  echo "$n"
+}
 cleanup() {
   if [[ -n $session ]]; then kill "$session" 2>/dev/null || true; fi
   kill "$xvnc" 2>/dev/null || true
+  if [[ $(sweep TERM) != 0 ]]; then sleep 3; sweep KILL >/dev/null; fi
+  kill $(jobs -p) 2>/dev/null || true
   wait 2>/dev/null || true
   rm -f "$sock"
 }
@@ -2480,9 +2673,29 @@ export DISPLAY=":$display"
 # vps-setup's desktop defaults (theme, no compositing, panel); your own settings still win
 export XDG_CONFIG_DIRS="@DESKTOP_XDG@:${XDG_CONFIG_DIRS:-/etc/xdg}"
 unset SESSION_MANAGER DBUS_SESSION_BUS_ADDRESS
-dbus-launch --exit-with-session startxfce4 &
+# every app started in this desktop inherits VPS_VNC_DESKTOP (see sweep) - this script does not
+VPS_VNC_DESKTOP=":$display" dbus-launch --exit-with-session startxfce4 &
 session=$!
-wait -n "$xvnc" "$session" || true
+
+# Close the desktop once no viewer has been connected for the user's vnc-timeout. It is read
+# again every 10 s, so a change applies without a restart. Counting starts only after a viewer
+# was connected, so a fresh desktop waits for its user however long that takes.
+seen=n
+last=$SECONDS
+while kill -0 "$xvnc" 2>/dev/null && kill -0 "$session" 2>/dev/null; do
+  if [[ -n $(ss -xH state connected src "$sock" 2>/dev/null) ]]; then
+    seen=y; last=$SECONDS
+  elif [[ $seen == y ]]; then
+    limit=$(@VNC_TIMEOUT_CMD@ --seconds 2>/dev/null || echo 0)
+    [[ $limit =~ ^[0-9]+$ ]] || limit=0
+    if (( limit > 0 && SECONDS - last >= limit )); then
+      echo "vnc-session: no viewer for $(( SECONDS - last )) s (vnc-timeout: $limit s) - closing the desktop and its apps"
+      exit 0
+    fi
+  fi
+  sleep 10 &
+  wait $! || true
+done
 EOF
 }
 
@@ -2506,9 +2719,84 @@ WantedBy=multi-user.target
 EOF
 }
 
+# vnc-timeout - the user-facing command (no sudo) behind the desktop's disconnect timeout.
+render_vnc_timeout() {
+  cat <<EOF
+#!/bin/bash
+# vnc-timeout - managed by vps-setup. How long your VNC desktop stays open after you disconnect.
+# Then it closes together with every app you opened in it, and a fresh desktop waits for you.
+#   vnc-timeout                     show the current setting
+#   vnc-timeout 30m | 2h | 3d | off set your own (a bare number is minutes; applies within 10 s)
+#   vnc-timeout default             use the server default again
+set -euo pipefail
+$(declare -f duration_secs)
+own="\$HOME/.vnc/disconnect-timeout"
+default_file="$VNC_TIMEOUT_DEFAULT"
+EOF
+  cat <<'EOF'
+effective() { # prints "<duration> <source>"
+  local f v
+  for f in "$own" "$default_file"; do
+    [[ -r $f ]] || continue
+    v=$(tr -d '[:space:]' <"$f")
+    if duration_secs "$v" >/dev/null 2>&1; then
+      if [[ $f == "$own" ]]; then echo "$v yours"; else echo "$v server-default"; fi
+      return 0
+    fi
+  done
+  echo "5m server-default"
+}
+describe() {
+  if [[ $(duration_secs "$1") == 0 ]]; then echo "VNC desktop: stays open after you disconnect ($2)"
+  else echo "VNC desktop: closes $1 after you disconnect, with every app in it ($2)"; fi
+}
+case ${1-} in
+  "") read -r v src < <(effective); describe "$v" "$src" ;;
+  --seconds) read -r v _ < <(effective); duration_secs "$v" ;;
+  default) rm -f "$own"; read -r v src < <(effective); describe "$v" "$src" ;;
+  -h|--help) sed -n '2,7s/^# \{0,1\}//p' "$0" ;;
+  *)
+    v=${1,,}
+    duration_secs "$v" >/dev/null || { echo "vnc-timeout: '$1' is not a duration - e.g. 30m, 2h, 3d, 90s or off" >&2; exit 2; }
+    mkdir -p "$HOME/.vnc"
+    printf '%s\n' "$v" >"$own"
+    describe "$v" "yours - applies within 10 s"
+    ;;
+esac
+EOF
+}
+
+install_vnc_timeout() {
+  install -d -m 755 "$LIB_DIR"
+  render_vnc_timeout >"$VNC_TIMEOUT_CMD"; chmod 755 "$VNC_TIMEOUT_CMD"
+  [[ -s $VNC_TIMEOUT_DEFAULT ]] || printf '5m\n' >"$VNC_TIMEOUT_DEFAULT"
+  chmod 644 "$VNC_TIMEOUT_DEFAULT"
+}
+
+# vps-setup vnc timeout <duration> [<user>] - without a user: the server default
+vnc_set_timeout() {
+  local dur=${1-} u=${2-} home what
+  [[ -n $dur ]] && duration_secs "$dur" >/dev/null \
+    || die "usage: vps-setup vnc timeout <30m|2h|3d|90s|off> [<user>]   (without a user: the server default)"
+  dur=${dur,,}
+  install_vnc_timeout
+  what="closes $dur after its user disconnects"
+  [[ $(duration_secs "$dur") == 0 ]] && what="stays open after its user disconnects"
+  if [[ -z $u ]]; then
+    printf '%s\n' "$dur" >"$VNC_TIMEOUT_DEFAULT"
+    ok "Server default: a VNC desktop $what. Users who set their own (vnc-timeout) keep theirs."
+  else
+    id "$u" &>/dev/null || die "No user '$u'."
+    home=$(home_of "$u")
+    runuser -u "$u" -- sh -c 'umask 077; mkdir -p "$1/.vnc"; printf "%s\n" "$2" >"$1/.vnc/disconnect-timeout"' sh "$home" "$dur"
+    ok "VNC for $u: the desktop $what (applies within 10 s; $u can change it: vnc-timeout)."
+  fi
+}
+
 cmd_vnc() {
   local action=${1-} u="" home pw="" a new_pw=n reset_look=n
   if (( $# > 0 )); then shift; fi
+  if [[ $action == timeout ]]; then vnc_set_timeout "$@"; return 0; fi
   for a in "$@"; do
     case $a in
       --new-password) new_pw=y ;;
@@ -2517,7 +2805,7 @@ cmd_vnc() {
       *) u=$a ;;
     esac
   done
-  [[ $action == enable || $action == disable ]] && [[ -n $u ]] || die "usage: vps-setup vnc enable|disable <user> [--new-password] [--reset-look]"
+  [[ $action == enable || $action == disable ]] && [[ -n $u ]] || die "usage: vps-setup vnc enable|disable <user> [--new-password] [--reset-look]  |  vnc timeout <30m|2h|3d|off> [<user>]"
   id "$u" &>/dev/null || die "No user '$u'."
   if [[ $action == disable ]]; then
     systemctl disable --now "vps-vnc@$u.service" >>"$LOG_FILE" 2>&1 || true
@@ -2533,8 +2821,10 @@ cmd_vnc() {
   if pkg_available tigervnc-tools; then pkgs+=(tigervnc-tools); fi
   run "Installing TigerVNC" apt_get install "${pkgs[@]}"
   install -d -m 755 "$LIB_DIR"
+  install_vnc_timeout
   render_vnc_session >"$VNC_SESSION"; chmod 755 "$VNC_SESSION"
   render_vnc_unit >"$VNC_UNIT_FILE"
+  retire_tigervnc "$u"   # one desktop per user - see retire_tigervnc
   # The desktop runs in the user's own slice, so it counts towards their fair share.
   install -d "/etc/systemd/system/vps-vnc@$u.service.d"
   printf '# Managed by vps-setup\n[Service]\nSlice=user-%s.slice\n' "$(id -u "$u")" >"/etc/systemd/system/vps-vnc@$u.service.d/10-slice.conf"
@@ -2562,6 +2852,7 @@ cmd_vnc() {
   if [[ -n $pw ]]; then note_cred "$u" "vnc password" "$pw"; else note "VNC for $u: password unchanged (a new one: sudo vps-setup vnc enable $u --new-password)."; fi
   note "VNC for $u: ssh -N -L 5901:$home/.vnc/vnc.sock $(hostname -s)   then a VNC viewer on localhost:5901"
   note "VNC viewer: set picture quality to High / full colour - on Auto or Low it shows only 256 colours."
+  note "VNC for $u: $(runuser -u "$u" -- "$VNC_TIMEOUT_CMD" 2>/dev/null || echo "closes after the server default once disconnected") - change it: vnc-timeout 2h"
   if [[ $IN_SETUP != y ]]; then print_credentials; fi
 }
 
@@ -3088,6 +3379,7 @@ cmd_setup() {
   try_step "Shell defaults, tmux, claude-session" apply_shell_defaults
   try_step "System hardening and tuning" apply_system_tuning
   try_step "Fair resource sharing between users" apply_fair_share
+  try_step "Memory guard (zswap, systemd-oomd)" apply_memory_guard
   try_step "Firewall" step_firewall
   try_step "fail2ban" step_fail2ban
   try_step "Node.js $NODE_MAJOR (system)" install_node
@@ -3469,6 +3761,12 @@ vps-setup $SCRIPT_VERSION - shared Claude Code dev server on Ubuntu
                                A personal VNC desktop for one user, through an SSH tunnel.
                                Enabling again keeps the password; --reset-look moves the
                                user's old desktop settings aside.
+  vnc timeout <30m|2h|3d|off> [<name>]
+                               After its user disconnects, a VNC desktop closes with all its
+                               apps once this time has passed (default 5m). Without a name:
+                               the server default. Users set their own with: vnc-timeout 2h
+  memory [apply|status]        zswap (compressed swap in RAM) and the OOM guard: systemd-oomd
+                               ends a thrashing user's heaviest app or VNC desktop, never sshd.
   apps install|remove <app>... Desktop apps for every desktop user: vscode, chrome, firefox,
   apps list                    vlc, gimp, libreoffice, ... or any Ubuntu package (no snaps).
   gitlab [apply|disable]       Re-apply (after editing GITLAB_* in $CONF_FILE) or remove
@@ -3548,6 +3846,7 @@ main() {
       docker_rootless_for "$1"; ok "Rootless Docker ready for $1." ;;
     rdp)           cmd_rdp "$@" ;;
     vnc)           cmd_vnc "$@" ;;
+    memory)        cmd_memory "$@" ;;
     gitlab)        cmd_gitlab "$@" ;;
     forward)       cmd_forward "$@" ;;
     usage)         cmd_usage "$@" ;;
