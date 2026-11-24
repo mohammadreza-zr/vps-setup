@@ -2268,7 +2268,6 @@ ssh_verify() { # ssh_verify <port>... - checks the EFFECTIVE config, not just ou
     grep -qxF "$want" <<<"$eff" || problems+=("expected '$want', effective: '$(grep -E "^${want%% *} " <<<"$eff" || echo unset)'")
   done
   grep -qE "^allowgroups( .*)? $SSH_GROUP( |\$)" <<<"$eff" || problems+=("AllowGroups does not include $SSH_GROUP")
-  if [[ -n $(ssh_stale_listeners) ]]; then problems+=("an old sshd (pid $(ssh_stale_listeners | xargs)) still holds a port with its old configuration - run: sudo vps-setup ssh"); fi
   if grep -qE '^allowusers ' <<<"$eff"; then problems+=("an AllowUsers line is still active"); fi
   if (( ${#problems[@]} > 0 )); then
     for line in "${problems[@]}"; do warn "sshd: $line"; done
@@ -2324,7 +2323,8 @@ ssh_restore() { # restore the snapshot and run sshd the way it ran before
 ssh_stale_listeners() {
   local main pid
   main=$(systemctl show ssh.service -p MainPID --value 2>/dev/null)
-  for pid in $(ss -Htlnp 2>/dev/null | grep '"sshd"' | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u); do
+  # only sshd's own pids: with socket activation systemd (pid 1) shares the same socket
+  for pid in $(ss -Htlnp 2>/dev/null | grep -oE '"sshd",pid=[0-9]+' | cut -d= -f2 | sort -u); do
     [[ $pid != "$main" ]] && printf '%s\n' "$pid"
   done
   return 0
@@ -2446,6 +2446,10 @@ ssh_apply() { # ssh_apply <port>...
   gitlab_keep_off_ports "${ports[@]}" "${old_ports[@]}"
   ssh_use_service_mode
   date +%s >"$ROLLBACK_DIR/applied_at"
+  if [[ -n $(ssh_stale_listeners) ]]; then
+    cancel_rollback; ssh_restore
+    die "An old sshd (pid $(ssh_stale_listeners | xargs)) still holds an SSH port with its old configuration - rolled back. Stop it, then: sudo vps-setup ssh"
+  fi
   for p in "${ports[@]}"; do if wait_port "$p"; then up+=("$p"); else down+=("$p"); fi; done
   if (( ${#up[@]} == 0 )); then
     cancel_rollback; ssh_restore
@@ -3722,6 +3726,7 @@ cmd_status() {
   if ssh_verify ${SSH_PORTS:-22} 2>/dev/null; then ok "Effective sshd config matches the hardening."; else warn "sshd config differs from the hardening - run: sudo vps-setup ssh"; fi
   local p; for p in ${SSH_PORTS:-22}; do if port_listening "$p"; then info "port $p: listening"; else warn "port $p: NOT listening"; fi; done
   if ssh_change_pending; then warn "An SSH change is waiting for $ADMIN_USER's first login (auto-rollback pending)."; fi
+  if [[ -n $(ssh_stale_listeners) ]]; then warn "An old sshd (pid $(ssh_stale_listeners | xargs)) holds an SSH port with its OLD configuration - run: sudo vps-setup ssh"; fi
 
   step "Internal GitLab"
   if [[ -n $GITLAB_HOST ]]; then
