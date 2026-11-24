@@ -1187,7 +1187,13 @@ function Cmd-Ban {
     $m = [string]$e.Message
     if (-not $m) { $m = (@($e.Properties | ForEach-Object { [string]$_.Value }) -join ' ') }
     if ($m -match 'Accepted ' -or $m -notmatch $bad) { continue }
-    $ipm = [regex]::Match($m, '(\d{1,3}(?:\.\d{1,3}){3}|[0-9A-Fa-f]*:[0-9A-Fa-f:]+) port \d+')
+    # The client's address is the LAST "<ip> port <n>" of the line: the user name a client
+    # sends comes before it and may itself contain "<ip> port <n>" (to get someone else -
+    # e.g. the admin - banned, and itself not). Only "Unable to negotiate with <ip> port <n>:
+    # ... Their offer: ..." has client text after the address, so it is read at the start.
+    $ipre = '(\d{1,3}(?:\.\d{1,3}){3}|[0-9A-Fa-f]*:[0-9A-Fa-f:]+) port \d+'
+    $ipm = [regex]::Match($m, "^(?:\S+:?\s+)?Unable to negotiate with $ipre")
+    if (-not $ipm.Success) { $all = [regex]::Matches($m, $ipre); if ($all.Count -gt 0) { $ipm = $all[$all.Count - 1] } }
     if (-not $ipm.Success) { continue }
     $ip = $ipm.Groups[1].Value
     if ($ip -like '127.*' -or $ip -eq '::1' -or (Ip-Trusted $ip $trusted)) { continue }

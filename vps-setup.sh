@@ -2446,7 +2446,16 @@ rm -f "$sock"
 
 if [[ -d /run/user/$uid ]]; then export XDG_RUNTIME_DIR="/run/user/$uid"; fi
 
-Xtigervnc ":$display" -rfbunixpath "$sock" -rfbunixmode 0600 -rfbport -1 -localhost -nolisten tcp \
+# The X display itself needs a cookie: without one the X server lets in EVERY local user
+# (/tmp/.X11-unix/X<n> is world-writable and the abstract socket has no permissions at
+# all), who could then watch, keylog and type into this desktop. A fresh one every start.
+xauth_file="$vnc_dir/Xauthority"
+rm -f "$xauth_file"
+( umask 077; : >"$xauth_file" )
+xauth -q -f "$xauth_file" add ":$display" . "$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+export XAUTHORITY="$xauth_file"
+
+Xtigervnc ":$display" -auth "$xauth_file" -rfbunixpath "$sock" -rfbunixmode 0600 -rfbport -1 -localhost -nolisten tcp \
   -SecurityTypes VncAuth -PasswordFile "$vnc_dir/passwd" \
   -geometry "$geometry" -depth 24 -desktop "$USER@$(hostname -s)" -AlwaysShared &
 xvnc=$!
