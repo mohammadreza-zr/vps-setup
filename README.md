@@ -145,6 +145,8 @@ Copy the new script to the server and run its setup — it installs itself over 
 sudo bash vps-setup.sh setup
 ```
 
+The setup also stops any sshd still listening with an older configuration (on Ubuntu 24.04 the switch from `ssh.socket` to `ssh.service` can leave one behind on port 22, still allowing the old settings such as root login). Check with `sudo ss -tlnp | grep sshd`: every port should show the same sshd pid.
+
 After upgrading from a version before the VNC authorization fix, restart each VNC desktop so it picks up the new session script (the VNC password is kept):
 
 ```bash
